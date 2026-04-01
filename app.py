@@ -494,28 +494,12 @@ with tabs[1]:
         "This segmentation reveals how a borrower's earning power shapes their loan decisions and repayment risk."
     )
 
-    # ── Year selector ─────────────────────────────────────────────────────
-    all_years = sorted(df["issue_year"].unique().tolist())
-    year_options = ["All Years"] + [str(y) for y in all_years]
-    sel_year = st.selectbox(
-        "📅 Filter loan behaviour by year:",
-        year_options,
-        index=0,
-        help="Filters all loan behaviour charts below. Income segment definition cards are always based on the full population."
-    )
-
-    if sel_year == "All Years":
-        seg_df = df.dropna(subset=["income_segment"])
-        year_label = "All Years (2012–2019)"
-    else:
-        seg_df = df[df["issue_year"] == int(sel_year)].dropna(subset=["income_segment"])
-        year_label = str(sel_year)
+    seg_df = df.dropna(subset=["income_segment"])
 
     # ── Segment summary cards ─────────────────────────────────────────────
     st.markdown("#### Income Segment Definitions")
     insight(
-        "These ranges are fixed — they reflect the income distribution of the full customer base. "
-        "The year filter below applies only to loan behaviour charts, not segment membership."
+        "These ranges are fixed — they reflect the income distribution of the full customer base."
     )
     sc1, sc2, sc3 = st.columns(3)
     for col, seg in zip([sc1, sc2, sc3], ["Low Income", "Mid Income", "High Income"]):
@@ -572,10 +556,9 @@ with tabs[1]:
 
     # ── Loan behaviour section ────────────────────────────────────────────
     st.markdown("---")
-    st.markdown(f"#### Loan Behaviour by Income Segment — *{year_label}*")
+    st.markdown("#### Loan Behaviour by Income Segment")
     insight(
-        "These charts show how borrowing patterns and credit risk differ across income groups. "
-        "Use the year filter above to see how each segment's behaviour evolved over time."
+        "These charts show how borrowing patterns and credit risk differ across income groups."
     )
 
     col1, col2 = st.columns(2)
