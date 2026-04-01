@@ -8,8 +8,15 @@ import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import re
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE CONFIG
@@ -184,6 +191,163 @@ def load_data():
 df, customer, state_region, loan_year, seg_ranges = load_data()
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ML — LOAN PREDICTOR
+# ─────────────────────────────────────────────────────────────────────────────
+INCOME_OPTIONS = {
+    "Under $30,000":       20_000,
+    "$30,000 – $50,000":   40_000,
+    "$50,000 – $75,000":   62_500,
+    "$75,000 – $100,000":  87_500,
+    "$100,000 – $150,000": 125_000,
+    "Over $150,000":       160_000,
+}
+INCOME_BINS   = [0, 30_000, 50_000, 75_000, 100_000, 150_000, 1e9]
+INCOME_LABELS = list(INCOME_OPTIONS.keys())
+
+EMP_OPTIONS = {
+    "Less than 1 year": 0,
+    "1 year": 1, "2 years": 2, "3 years": 3, "4 years": 4,
+    "5 years": 5, "6 years": 6, "7 years": 7, "8 years": 8,
+    "9 years": 9, "10+ years": 10,
+}
+
+PURPOSE_DISPLAY = {
+    "debt_consolidation": "Debt Consolidation",
+    "credit_card":        "Credit Card Payoff",
+    "home_improvement":   "Home Improvement",
+    "other":              "Other",
+    "major_purchase":     "Major Purchase",
+    "medical":            "Medical",
+    "small_business":     "Small Business",
+    "car":                "Car",
+    "vacation":           "Vacation",
+    "moving":             "Moving / Relocation",
+    "house":              "House",
+    "wedding":            "Wedding",
+    "renewable_energy":   "Renewable Energy",
+    "educational":        "Educational",
+}
+
+HOME_OPTIONS = ["MORTGAGE", "RENT", "OWN"]
+HOME_DISPLAY = {"MORTGAGE": "Mortgage", "RENT": "Rent", "OWN": "Own"}
+
+
+@st.cache_resource(show_spinner="Training prediction models…")
+def train_models(_df):
+    """
+    Hybrid approach:
+      - Loan Amount  : GradientBoosting regression  (predicted from user inputs)
+      - Interest Rate: historical percentile lookup      (p25 / median / p75 for similar borrowers)
+    Interest rate is almost entirely determined by credit grade (FICO-based), which is not
+    available as a user input — so regression adds no value.  Percentile lookup from 270K
+    real loans is far more informative and honest.
+    """
+
+    def parse_emp(s):
+        if pd.isna(s) or str(s).strip().lower() in ["n/a", "nan", ""]:
+            return 3
+        s = str(s)
+        if "10+" in s:
+            return 10
+        if "< 1" in s or "<1" in s:
+            return 0
+        m = re.search(r"\d+", s)
+        return int(m.group()) if m else 3
+
+    cols = ["loan_amount", "int_rate_pct", "annual_inc", "emp_length",
+            "purpose", "home_ownership", "avg_cur_bal", "Tot_cur_bal"]
+    ml = _df[cols].copy()
+    ml["emp_length_yrs"] = ml["emp_length"].apply(parse_emp)
+    ml = ml.drop(columns=["emp_length"])
+    ml = ml.dropna()
+    ml = ml[ml["home_ownership"].isin(HOME_OPTIONS)]
+
+    NUMERIC  = ["annual_inc", "emp_length_yrs", "avg_cur_bal", "Tot_cur_bal"]
+    CATEG    = ["purpose", "home_ownership"]
+
+    # ── Loan amount model ─────────────────────────────────────────────────
+    X = ml[NUMERIC + CATEG]
+    y_amt = ml["loan_amount"]
+    X_tr, X_te, ya_tr, ya_te = train_test_split(X, y_amt, test_size=0.15, random_state=42)
+
+    pre = ColumnTransformer([
+        ("cat", OneHotEncoder(handle_unknown="ignore", sparse_output=False), CATEG),
+    ], remainder="passthrough")
+    pipe_amt = Pipeline([
+        ("pre", pre),
+        ("model", GradientBoostingRegressor(
+            n_estimators=120, max_depth=5, learning_rate=0.1,
+            min_samples_leaf=30, random_state=42, subsample=0.8
+        )),
+    ])
+    pipe_amt.fit(X_tr, ya_tr)
+    r2_amt = r2_score(ya_te, pipe_amt.predict(X_te))
+
+    # ── Rate lookup table: income_bucket × purpose ────────────────────────
+    ml["inc_label"] = pd.cut(ml["annual_inc"], bins=INCOME_BINS, labels=INCOME_LABELS)
+    rate_lookup = (
+        ml.groupby(["inc_label", "purpose"], observed=True)["int_rate_pct"]
+        .agg(rate_p25=lambda x: x.quantile(0.25),
+             rate_med=lambda x: x.quantile(0.50),
+             rate_p75=lambda x: x.quantile(0.75),
+             n="count")
+        .reset_index()
+    )
+    # Fallback: income-only lookup (when purpose bucket is thin)
+    rate_lookup_inc = (
+        ml.groupby("inc_label", observed=True)["int_rate_pct"]
+        .agg(rate_p25=lambda x: x.quantile(0.25),
+             rate_med=lambda x: x.quantile(0.50),
+             rate_p75=lambda x: x.quantile(0.75))
+        .reset_index()
+    )
+
+    # ── Background features (median balances per income bucket) ───────────
+    bg = ml.groupby("inc_label", observed=True)[["avg_cur_bal", "Tot_cur_bal"]].median()
+
+    # ── Feature importance for loan amount model ──────────────────────────
+    cat_features = (pipe_amt.named_steps["pre"]
+                    .named_transformers_["cat"]
+                    .get_feature_names_out(CATEG).tolist())
+    feat_names = cat_features + NUMERIC
+    importance = pipe_amt.named_steps["model"].feature_importances_
+
+    return pipe_amt, r2_amt, rate_lookup, rate_lookup_inc, bg, feat_names, importance
+
+
+def get_rate_range(rate_lookup, rate_lookup_inc, inc_label, purpose):
+    """Return (p25, median, p75) interest rate for the given profile."""
+    row = rate_lookup[
+        (rate_lookup["inc_label"] == inc_label) &
+        (rate_lookup["purpose"]   == purpose)
+    ]
+    if len(row) > 0 and float(row["n"].iloc[0]) >= 30:
+        r = row.iloc[0]
+        return float(r["rate_p25"]), float(r["rate_med"]), float(r["rate_p75"])
+    # Fallback: income bucket only
+    row2 = rate_lookup_inc[rate_lookup_inc["inc_label"] == inc_label]
+    if len(row2) > 0:
+        r = row2.iloc[0]
+        return float(r["rate_p25"]), float(r["rate_med"]), float(r["rate_p75"])
+    return 10.0, 13.5, 18.0   # global fallback
+
+
+def calc_installment(loan_amt, int_rate_pct, months):
+    r = (int_rate_pct / 100) / 12
+    if r == 0:
+        return loan_amt / months
+    return loan_amt * (r * (1 + r) ** months) / ((1 + r) ** months - 1)
+
+
+def profile_label(int_rate_pct):
+    if int_rate_pct < 8:   return "Excellent",      "#2ecc71"
+    if int_rate_pct < 12:  return "Good",            "#1abc9c"
+    if int_rate_pct < 18:  return "Average",         "#f39c12"
+    if int_rate_pct < 24:  return "Below Average",   "#e67e22"
+    return "Higher Risk",  "#e74c3c"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # HEADER
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -204,6 +368,7 @@ tabs = st.tabs([
     "📊 Loan Analysis",
     "🗺️ Regional Analysis",
     "📈 Temporal Trends",
+    "🤖 Loan Predictor",
 ])
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -889,26 +1054,225 @@ with tabs[4]:
     fig.update_layout(margin=dict(t=10))
     st.plotly_chart(fig, use_container_width=True)
 
-    st.markdown("#### Loan Grade Mix Over Time")
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  TAB 6 · LOAN PREDICTOR                                                  ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+with tabs[5]:
+    st.markdown("### 🤖 Loan Predictor")
     insight(
-        "Shows whether the platform's credit standards shifted over time. "
-        "A growing share of lower grades (E–G) in later years may indicate "
-        "loosening underwriting or deliberate expansion into riskier borrower segments."
+        "This tool combines a <b>Gradient Boosting ML model</b> (for loan amount) with "
+        "<b>historical percentile analysis</b> (for interest rate) across 270,000 real loans. "
+        "The interest rate is driven primarily by credit score (FICO) — data not captured here — "
+        "so instead of an unreliable regression, we show the actual rate range received by "
+        "borrowers with your income and purpose profile. This is more honest and more useful."
     )
-    yg = (
-        df.groupby(["issue_year", "grade"])
-        .size()
-        .reset_index(name="count")
-    )
-    fig = px.bar(
-        yg, x="issue_year", y="count", color="grade",
-        barmode="stack",
-        category_orders={"grade": GRADE_ORDER},
-        labels={"count": "Loan Count", "issue_year": "Year"},
-        height=380, template=TEMPLATE,
-    )
-    fig.update_layout(margin=dict(t=10))
-    st.plotly_chart(fig, use_container_width=True)
+
+    # ── Train models (cached) ─────────────────────────────────────────────
+    (pipe_amt, r2_amt,
+     rate_lookup, rate_lookup_inc,
+     bg, feat_names, importance) = train_models(df)
+
+    # ── Model info strip ──────────────────────────────────────────────────
+    ma1, ma2, ma3 = st.columns(3)
+    ma1.metric("Loan Amount Model (R²)", f"{r2_amt:.2f}",
+               help="R² = 1.0 is perfect. Loan amount R² of ~0.26 is expected given limited features.")
+    ma2.metric("Rate Method", "Percentile Lookup",
+               help="Rate shown as actual p25/median/p75 from 270K historical loans for your profile.")
+    ma3.metric("Training Records", f"{len(df):,}")
+
+    st.markdown("---")
+    st.markdown("#### Enter Your Profile")
+
+    # ── Input dropdowns ───────────────────────────────────────────────────
+    c1, c2, c3, c4 = st.columns(4)
+
+    with c1:
+        sel_income = st.selectbox(
+            "💵 Annual Income Range",
+            list(INCOME_OPTIONS.keys()),
+            index=2,
+            help="Select the bracket closest to your gross annual income."
+        )
+    with c2:
+        sel_emp = st.selectbox(
+            "💼 Employment Length",
+            list(EMP_OPTIONS.keys()),
+            index=4,
+            help="How many years you have been continuously employed."
+        )
+    with c3:
+        purpose_labels = list(PURPOSE_DISPLAY.values())
+        purpose_keys   = list(PURPOSE_DISPLAY.keys())
+        sel_purpose_label = st.selectbox(
+            "🎯 Loan Purpose",
+            purpose_labels,
+            index=0,
+            help="What will you use the loan for?"
+        )
+        sel_purpose = purpose_keys[purpose_labels.index(sel_purpose_label)]
+    with c4:
+        sel_home_label = st.selectbox(
+            "🏠 Home Ownership",
+            [HOME_DISPLAY[h] for h in HOME_OPTIONS],
+            index=1,
+            help="Your current housing situation."
+        )
+        sel_home = HOME_OPTIONS[[HOME_DISPLAY[h] for h in HOME_OPTIONS].index(sel_home_label)]
+
+    st.markdown("")
+    predict_btn = st.button("🔍 Predict My Loan", type="primary")
+
+    # ── Prediction ────────────────────────────────────────────────────────
+    if predict_btn:
+        income_val = INCOME_OPTIONS[sel_income]
+        emp_yrs    = EMP_OPTIONS[sel_emp]
+
+        # Background balance features (median for this income bucket)
+        inc_cut = pd.cut([income_val], bins=INCOME_BINS, labels=INCOME_LABELS)[0]
+        avg_bal = float(bg.loc[inc_cut, "avg_cur_bal"]) if inc_cut in bg.index else float(bg["avg_cur_bal"].median())
+        tot_bal = float(bg.loc[inc_cut, "Tot_cur_bal"]) if inc_cut in bg.index else float(bg["Tot_cur_bal"].median())
+
+        X_pred = pd.DataFrame([{
+            "annual_inc":     income_val,
+            "emp_length_yrs": emp_yrs,
+            "avg_cur_bal":    avg_bal,
+            "Tot_cur_bal":    tot_bal,
+            "purpose":        sel_purpose,
+            "home_ownership": sel_home,
+        }])
+
+        raw_amt  = float(pipe_amt.predict(X_pred)[0])
+        pred_amt = max(1_000, min(40_000, round(raw_amt / 500) * 500))
+
+        # Rate range from historical data
+        rate_p25, rate_med, rate_p75 = get_rate_range(
+            rate_lookup, rate_lookup_inc, inc_cut, sel_purpose
+        )
+
+        # Installments at median rate
+        inst_36 = calc_installment(pred_amt, rate_med, 36)
+        inst_60 = calc_installment(pred_amt, rate_med, 60)
+
+        label, label_color = profile_label(rate_med)
+
+        st.markdown("---")
+        st.markdown("#### Your Estimated Loan Offer")
+
+        # ── Result cards ─────────────────────────────────────────────────
+        r1, r2, r3, r4, r5 = st.columns(5)
+        r1.metric("💰 Loan Amount",         f"${pred_amt:,.0f}",
+                  help="ML model prediction based on your profile.")
+        r2.metric("📈 Typical Rate",        f"{rate_med:.1f}%",
+                  help=f"Median rate for similar borrowers. Range: {rate_p25:.1f}% – {rate_p75:.1f}%")
+        r3.metric("📉 Best Rate (25th %)",  f"{rate_p25:.1f}%",
+                  help="25% of similar borrowers received this rate or lower.")
+        r4.metric("🗓️ Monthly · 36 months",  f"${inst_36:,.0f}",
+                  help="At median interest rate.")
+        r5.metric("🗓️ Monthly · 60 months",  f"${inst_60:,.0f}",
+                  help="At median interest rate.")
+
+        # ── Profile banner ────────────────────────────────────────────────
+        total_interest_36 = inst_36 * 36 - pred_amt
+        total_interest_60 = inst_60 * 60 - pred_amt
+        interest_saved    = total_interest_60 - total_interest_36
+        st.markdown(
+            f"<div style='background:{label_color}22; border-left:4px solid {label_color}; "
+            f"border-radius:0 8px 8px 0; padding:14px 20px; margin:12px 0;'>"
+            f"<span style='color:{label_color}; font-weight:700; font-size:1.05rem;'>"
+            f"{label} Credit Profile</span><br>"
+            f"<span style='color:#aabbcc; font-size:0.9rem;'>"
+            f"Borrowers with your profile ({sel_income} income, {sel_emp} of employment, "
+            f"<b>{sel_purpose_label}</b>, <b>{sel_home_label}</b>) historically received rates "
+            f"between <b>{rate_p25:.1f}% – {rate_p75:.1f}%</b>, with a median of <b>{rate_med:.1f}%</b>. "
+            f"The model estimates an approval of <b>${pred_amt:,.0f}</b>. "
+            f"Choosing 36 months over 60 months saves approximately "
+            f"<b>${interest_saved:,.0f}</b> in total interest."
+            f"</span></div>",
+            unsafe_allow_html=True,
+        )
+
+        st.markdown("---")
+
+        col1, col2 = st.columns(2)
+
+        # ── Rate range visualization ──────────────────────────────────────
+        with col1:
+            st.markdown("#### Interest Rate Range for Your Profile")
+            st.caption("Based on actual rates received by similar borrowers in historical data.")
+            rate_fig_df = pd.DataFrame({
+                "Percentile": ["Best (25th %ile)", "Typical (Median)", "Higher (75th %ile)"],
+                "Rate (%)":   [rate_p25, rate_med, rate_p75],
+                "Color":      ["#2ecc71", "#f39c12", "#e74c3c"],
+            })
+            fig = px.bar(
+                rate_fig_df, x="Percentile", y="Rate (%)",
+                color="Percentile",
+                color_discrete_map={
+                    "Best (25th %ile)":    "#2ecc71",
+                    "Typical (Median)":    "#f39c12",
+                    "Higher (75th %ile)":  "#e74c3c",
+                },
+                text="Rate (%)",
+                height=340, template=TEMPLATE,
+            )
+            fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+            fig.update_layout(showlegend=False, margin=dict(t=20),
+                              yaxis=dict(range=[0, rate_p75 * 1.25]))
+            st.plotly_chart(fig, use_container_width=True)
+
+        # ── Total cost comparison ─────────────────────────────────────────
+        with col2:
+            st.markdown("#### Total Cost: 36 vs 60 Months")
+            st.caption("Stacked bars show principal + total interest paid at median rate.")
+            cost_df = pd.DataFrame({
+                "Term":           ["36 months", "60 months"],
+                "Principal":      [pred_amt,    pred_amt],
+                "Total Interest": [total_interest_36, total_interest_60],
+            })
+            fig = px.bar(
+                cost_df.melt(id_vars="Term", value_vars=["Principal", "Total Interest"],
+                             var_name="Component", value_name="Amount ($)"),
+                x="Term", y="Amount ($)", color="Component",
+                barmode="stack",
+                color_discrete_map={"Principal": "#00d4ff", "Total Interest": "#e74c3c"},
+                height=340, template=TEMPLATE,
+            )
+            fig.update_layout(margin=dict(t=20), legend_title="")
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("---")
+        # ── Feature importance ────────────────────────────────────────────
+        st.markdown("#### What Drives Loan Amount Predictions?")
+        insight(
+            "Feature importance from the Gradient Boosting model shows which input variables "
+            "most influence the predicted loan amount. Annual income and current debt balance "
+            "tend to dominate — they are the strongest signals of repayment capacity."
+        )
+        fi = (pd.DataFrame({"feature": feat_names, "importance": importance})
+              .sort_values("importance", ascending=True)
+              .tail(12))
+        fi["feature"] = (fi["feature"]
+                         .str.replace("cat__purpose_", "Purpose: ", regex=False)
+                         .str.replace("cat__home_ownership_", "Ownership: ", regex=False)
+                         .str.replace("annual_inc", "Annual Income", regex=False)
+                         .str.replace("emp_length_yrs", "Employment Length (yrs)", regex=False)
+                         .str.replace("avg_cur_bal", "Avg Current Balance", regex=False)
+                         .str.replace("Tot_cur_bal", "Total Current Balance", regex=False))
+        fig = px.bar(fi, x="importance", y="feature", orientation="h",
+                     color_discrete_sequence=["#00d4ff"],
+                     labels={"importance": "Importance Score", "feature": ""},
+                     height=420, template=TEMPLATE)
+        fig.update_layout(margin=dict(t=10))
+        st.plotly_chart(fig, use_container_width=True)
+
+    else:
+        st.markdown(
+            "<div style='text-align:center; padding:40px; color:#445566; font-size:1rem;'>"
+            "Fill in your profile above and click <b style='color:#00d4ff;'>Predict My Loan</b> "
+            "to see your estimated loan offer."
+            "</div>",
+            unsafe_allow_html=True,
+        )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FOOTER
