@@ -1072,15 +1072,6 @@ with tabs[5]:
      rate_lookup, rate_lookup_inc,
      bg, feat_names, importance) = train_models(df)
 
-    # ── Model info strip ──────────────────────────────────────────────────
-    ma1, ma2, ma3 = st.columns(3)
-    ma1.metric("Loan Amount Model (R²)", f"{r2_amt:.2f}",
-               help="R² = 1.0 is perfect. Loan amount R² of ~0.26 is expected given limited features.")
-    ma2.metric("Rate Method", "Percentile Lookup",
-               help="Rate shown as actual p25/median/p75 from 270K historical loans for your profile.")
-    ma3.metric("Training Records", f"{len(df):,}")
-
-    st.markdown("---")
     st.markdown("#### Enter Your Profile")
 
     # ── Input dropdowns ───────────────────────────────────────────────────
@@ -1191,79 +1182,6 @@ with tabs[5]:
             unsafe_allow_html=True,
         )
 
-        st.markdown("---")
-
-        col1, col2 = st.columns(2)
-
-        # ── Rate range visualization ──────────────────────────────────────
-        with col1:
-            st.markdown("#### Interest Rate Range for Your Profile")
-            st.caption("Based on actual rates received by similar borrowers in historical data.")
-            rate_fig_df = pd.DataFrame({
-                "Percentile": ["Best (25th %ile)", "Typical (Median)", "Higher (75th %ile)"],
-                "Rate (%)":   [rate_p25, rate_med, rate_p75],
-                "Color":      ["#2ecc71", "#f39c12", "#e74c3c"],
-            })
-            fig = px.bar(
-                rate_fig_df, x="Percentile", y="Rate (%)",
-                color="Percentile",
-                color_discrete_map={
-                    "Best (25th %ile)":    "#2ecc71",
-                    "Typical (Median)":    "#f39c12",
-                    "Higher (75th %ile)":  "#e74c3c",
-                },
-                text="Rate (%)",
-                height=340, template=TEMPLATE,
-            )
-            fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
-            fig.update_layout(showlegend=False, margin=dict(t=20),
-                              yaxis=dict(range=[0, rate_p75 * 1.25]))
-            st.plotly_chart(fig, use_container_width=True)
-
-        # ── Total cost comparison ─────────────────────────────────────────
-        with col2:
-            st.markdown("#### Total Cost: 36 vs 60 Months")
-            st.caption("Stacked bars show principal + total interest paid at median rate.")
-            cost_df = pd.DataFrame({
-                "Term":           ["36 months", "60 months"],
-                "Principal":      [pred_amt,    pred_amt],
-                "Total Interest": [total_interest_36, total_interest_60],
-            })
-            fig = px.bar(
-                cost_df.melt(id_vars="Term", value_vars=["Principal", "Total Interest"],
-                             var_name="Component", value_name="Amount ($)"),
-                x="Term", y="Amount ($)", color="Component",
-                barmode="stack",
-                color_discrete_map={"Principal": "#00d4ff", "Total Interest": "#e74c3c"},
-                height=340, template=TEMPLATE,
-            )
-            fig.update_layout(margin=dict(t=20), legend_title="")
-            st.plotly_chart(fig, use_container_width=True)
-
-        st.markdown("---")
-        # ── Feature importance ────────────────────────────────────────────
-        st.markdown("#### What Drives Loan Amount Predictions?")
-        insight(
-            "Feature importance from the Gradient Boosting model shows which input variables "
-            "most influence the predicted loan amount. Annual income and current debt balance "
-            "tend to dominate — they are the strongest signals of repayment capacity."
-        )
-        fi = (pd.DataFrame({"feature": feat_names, "importance": importance})
-              .sort_values("importance", ascending=True)
-              .tail(12))
-        fi["feature"] = (fi["feature"]
-                         .str.replace("cat__purpose_", "Purpose: ", regex=False)
-                         .str.replace("cat__home_ownership_", "Ownership: ", regex=False)
-                         .str.replace("annual_inc", "Annual Income", regex=False)
-                         .str.replace("emp_length_yrs", "Employment Length (yrs)", regex=False)
-                         .str.replace("avg_cur_bal", "Avg Current Balance", regex=False)
-                         .str.replace("Tot_cur_bal", "Total Current Balance", regex=False))
-        fig = px.bar(fi, x="importance", y="feature", orientation="h",
-                     color_discrete_sequence=["#00d4ff"],
-                     labels={"importance": "Importance Score", "feature": ""},
-                     height=420, template=TEMPLATE)
-        fig.update_layout(margin=dict(t=10))
-        st.plotly_chart(fig, use_container_width=True)
 
     else:
         st.markdown(
